@@ -5,6 +5,34 @@ import os
 raw = pd.read_csv("data/esif_2014_2020_payments.csv", encoding="utf-8-sig")
 print(f"Raw shape: {raw.shape}")
 
+# VALIDATION
+# Every check is recorded with its stage, value, rule and status.
+# "fail" stops the pipeline before anything is exported; "warn" is reported but does not stop it.
+checks = []
+
+def check(stage, name, value, ok, rule, severity="fail"):
+    checks.append({
+        "stage": stage, "check": name, "value": value, "rule": rule,
+        "status": "pass" if ok else severity,
+    })
+
+REQUIRED_COLS = [
+    "ms", "ms_name", "cci", "title", "fund", "category_of_region", "year",
+    "net_planned_eu_amount", "total_net_payments",
+    "eu_payment_rate_on_planned_eu_amount",
+    "cumulative_interim_payments", "net_pre_financing",
+]
+RAW_KEY = ["cci", "fund", "category_of_region", "year"]
+
+# Stage 1: raw extract
+missing_cols = [c for c in REQUIRED_COLS if c not in raw.columns]
+check("raw", "required_columns_present", len(missing_cols), len(missing_cols) == 0, "0 missing columns")
+check("raw", "duplicate_programme_fund_region_year", int(raw.duplicated(RAW_KEY).sum()),
+      raw.duplicated(RAW_KEY).sum() == 0, "0 duplicates on " + "/".join(RAW_KEY))
+# An extract of exactly 1,000 rows often means a download or API row limit was hit
+check("raw", "row_count_not_capped", len(raw), len(raw) != 1000,
+      "!= 1000 (possible export limit)", severity="warn")
+
 # we use 2023 as the main snapshot year; 100 rows, 23 countries, most complete
 snap = raw[raw["year"] == 2023].copy()
 
@@ -50,6 +78,7 @@ fund_map = {
     "YEI Specific Allocation":     "YEI",
     "IPAE-contribution from ERDF": "IPAE"
 }
+snap["fund_type_raw"] = snap["fund_type"]
 snap["fund_type"] = snap["fund_type"].replace(fund_map)
 
 # Payment status: governance traffic-light categorisation
@@ -83,6 +112,36 @@ ts["payment_rate_on_planned_amount"] = (
 # we drop 2025/2026 from time series — incomplete coverage skews the rate upward
 ts = ts[ts["year"] <= 2024]
 
+
+# Stage 2: cleaned snapshot
+SNAP_KEY = ["programme_code", "fund_type_raw", "region_category"]
+check("snapshot", "programme_rows_unique",
+      int(snap.duplicated(SNAP_KEY).sum()), snap.duplicated(SNAP_KEY).sum() == 0,
+      "0 duplicates on programme/fund/region")
+key_fields = ["country", "programme_code", "planned_eur", "total_payments_eur"]
+n_missing_keys = int(snap[key_fields].isnull().sum().sum())
+check("snapshot", "no_missing_key_fields", n_missing_keys, n_missing_keys == 0, "0 missing in " + ", ".join(key_fields))
+n_negative = int((snap[money_cols] < 0).sum().sum())
+check("snapshot", "no_negative_amounts", n_negative, n_negative == 0, "0 negative amounts")
+rates = snap["payment_rate_on_planned_amount"].dropna()
+n_bad_rates = int(((rates < 0) | (rates > 105)).sum())
+check("snapshot", "payment_rate_in_range", n_bad_rates, n_bad_rates == 0, "0 rates outside 0-105%")
+n_missing_rate = int(snap["payment_rate_on_planned_amount"].isnull().sum())
+check("snapshot", "payment_rate_available", n_missing_rate, n_missing_rate == 0,
+      "0 programmes without a payment rate", severity="warn")
+planned_pos = snap["planned_eur"] > 0
+n_overpaid = int((snap.loc[planned_pos, "total_payments_eur"] > 1.05 * snap.loc[planned_pos, "planned_eur"]).sum())
+check("snapshot", "payments_within_planned", n_overpaid, n_overpaid == 0, "payments <= 105% of planned")
+rate_recalc = snap.loc[planned_pos, "total_payments_eur"] / snap.loc[planned_pos, "planned_eur"] * 100
+rate_gap = (rate_recalc - snap.loc[planned_pos, "payment_rate_on_planned_amount"]).abs().max()
+check("snapshot", "payment_rate_matches_amounts", round(float(rate_gap), 3), rate_gap < 0.5,
+      "reported rate within 0.5 pp of payments / planned", severity="warn")
+raw_2023 = raw[raw["year"] == 2023]
+planned_raw = pd.to_numeric(raw_2023["net_planned_eu_amount"], errors="coerce").sum()
+recon_gap = abs(snap["planned_eur"].sum() - planned_raw)
+check("snapshot", "planned_total_reconciles_to_raw", round(float(recon_gap), 2), recon_gap < 1,
+      "snapshot planned total = raw 2023 total (< EUR 1)")
+
 # data quality report
 print("\n=== DATA QUALITY REPORT ===")
 print(f"Snapshot year: 2023 | Programmes: {len(snap)} | Countries: {snap['country'].nunique()}")
@@ -113,10 +172,21 @@ print(f"  Total paid:     €{snap['total_payments_eur'].sum()/1e9:.1f}B")
 print(f"  Total remaining planned amount :  €{snap['remaining_eur'].sum()/1e9:.1f}B")
 print(f"  Overall rate:   {snap['total_payments_eur'].sum()/snap['planned_eur'].sum()*100:.1f}%")
 
+
+# Stage 3: report and stop on failures (before anything is exported)
+report = pd.DataFrame(checks)
+print("\n=== VALIDATION CHECKS ===")
+print(report.to_string(index=False))
+os.makedirs("data/clean", exist_ok=True)
+report.to_csv("data/clean/validation_report.csv", index=False, encoding="utf-8-sig")
+failed = report[report["status"] == "fail"]
+if len(failed) > 0:
+    raise SystemExit(f"\n{len(failed)} validation check(s) failed - nothing exported. See data/clean/validation_report.csv")
+
 # exporting
 os.makedirs("data/clean", exist_ok=True)
 
-snap.to_csv("data/clean/esif_snapshot_2023.csv",
+snap.drop(columns=["fund_type_raw"]).to_csv("data/clean/esif_snapshot_2023.csv",
             index=False, encoding="utf-8-sig")
 
 ts.to_csv("data/clean/esif_timeseries.csv",
@@ -124,5 +194,5 @@ ts.to_csv("data/clean/esif_timeseries.csv",
 
 print("\n✓ Saved: data/clean/esif_snapshot_2023.csv")
 print("✓ Saved: data/clean/esif_timeseries.csv")
-print(f"  Snapshot shape: {snap.shape}")
+print(f"  Snapshot shape: {snap.drop(columns=['fund_type_raw']).shape}")
 print(f"  Time series shape: {ts.shape}")

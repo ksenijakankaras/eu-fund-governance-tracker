@@ -1,0 +1,12 @@
+﻿stage,check,value,rule,status
+raw,required_columns_present,0.0,0 missing columns,pass
+raw,duplicate_programme_fund_region_year,0.0,0 duplicates on cci/fund/category_of_region/year,pass
+raw,row_count_not_capped,1000.0,!= 1000 (possible export limit),warn
+snapshot,programme_rows_unique,0.0,0 duplicates on programme/fund/region,pass
+snapshot,no_missing_key_fields,0.0,"0 missing in country, programme_code, planned_eur, total_payments_eur",pass
+snapshot,no_negative_amounts,0.0,0 negative amounts,pass
+snapshot,payment_rate_in_range,0.0,0 rates outside 0-105%,pass
+snapshot,payment_rate_available,1.0,0 programmes without a payment rate,warn
+snapshot,payments_within_planned,0.0,payments <= 105% of planned,pass
+snapshot,payment_rate_matches_amounts,4.828,reported rate within 0.5 pp of payments / planned,warn
+snapshot,planned_total_reconciles_to_raw,0.0,snapshot planned total = raw 2023 total (< EUR 1),pass
